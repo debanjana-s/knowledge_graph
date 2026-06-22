@@ -1,6 +1,17 @@
 # GraphRAG for Oral Cancer Knowledge Graph
 
-A Neo4j‑based GraphRAG that retrieves evidence‑grounded facts from a knowledge graph built from COSMIC, CancerMine, and HeNeCOn, and formats them for the orchestrator's RAG fallback.
+A Neo4j‑based GraphRAG system designed specifically for oral cancer clinical decision support. It is as the evidence engine for the COSMIC Gene Census, orchestrator, providing structured, citation‑backed facts when the medical LLM's confidence is low.
+
+The service bridges the gap between the orchestrator's low‑confidence state and the Knowledge Graph by:
+
+Retrieving structured evidence from Neo4j – gene roles, tissues, mutation types, syndromes, ClinVar‑annotated mutations, disease associations (from COSMIC), and literature‑mined gene‑cancer roles with citation counts (from CancerMine).
+
+Scoring evidence objectively using COSMIC Tiers, ClinVar classifications, and CancerMine citation counts.
+
+Formatting the evidence into a bulleted, numbered context string that the orchestrator can directly paste into the augmented prompt.
+
+This builds a knowledge graph that integrates COSMIC Gene Census, COSMIC Mutation Census, CancerMine , and HeNeCOn (Head and Neck Cancer Ontology). It exposes a simple REST API that the orchestrator calls when confidence is low, returning evidence snippets with relevance scores and a formatted context string ready for LLM ingestion.
+
 
 ## Repository Structure
 
@@ -24,8 +35,7 @@ knowledge_graph/
 
 | Requirement | Details |
 |-------------|---------|
-| Neo4j | Running with the `cosmicmutationhenecon` database populated. |
-| Python | ≥ 3.9 |
+| Neo4j | Running with the database populated. |
 | Dependencies | See `requirements.txt`. |
 
 ## Setup
@@ -33,8 +43,8 @@ knowledge_graph/
 ### 1. Clone & Install
 
 ```bash
-git clone <your-repo-url>
-cd graphrag_service
+git clone https://github.com/debanjana-s/knowledge_graph.git
+cd graphrag
 pip install -r requirements.txt
 ```
 
