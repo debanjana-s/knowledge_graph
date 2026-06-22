@@ -1,8 +1,8 @@
 # GraphRAG for Oral Cancer Knowledge Graph
 
-A Neo4j‑based GraphRAG system designed specifically for oral cancer clinical decision support. It is as the evidence engine for the COSMIC Gene Census, orchestrator, providing structured, citation‑backed facts when the medical LLM's confidence is low.
+A Neo4j‑based GraphRAG system for oral cancer clinical decision support. It acts as the evidence engine for the orchestrator, providing structured, citation‑backed facts when the medical LLM's confidence is low.
 
-The service bridges the gap between the orchestrator's low‑confidence state and the Knowledge Graph by:
+It bridges the gap between the orchestrator's low‑confidence state and the Knowledge Graph by:
 
 Retrieving structured evidence from Neo4j – gene roles, tissues, mutation types, syndromes, ClinVar‑annotated mutations, disease associations (from COSMIC), and literature‑mined gene‑cancer roles with citation counts (from CancerMine).
 
