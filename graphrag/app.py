@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 #GraphRAG Microservice - Flask API for orchestrator integration.
 
@@ -52,7 +53,8 @@ def retrieve():
 
         query = data.get('query', '')
         patient_context = data.get('patient_context', {})
-        top_k = data.get('top_k', 5)
+        tumor_type = patient_context.get('tumor_type', None)
+        top_k = data.get('top_k', None)
 
         gene_symbols = []
         for g in patient_context.get('genes', []):
@@ -64,24 +66,32 @@ def retrieve():
             found = re.findall(r'\b[A-Z][A-Z0-9]{1,8}\b', query)
             gene_symbols = list(set(found))
 
-        tumor_type = patient_context.get('tumor_type', None)
-
         if not gene_symbols:
             return jsonify({
                 "retrievals": [],
-                "formatted_context": "_No genes provided in patient context or query._"
+                "kg_summary": "_No genes provided in patient context or query._"
             }), 200
 
         ret = get_retriever()
         raw_results = ret.retrieve_for_genes(gene_symbols, tumor_type=tumor_type, max_ancestors=3)
 
         org = get_organizer()
-        retrievals = org.format_retrievals(raw_results, top_k=top_k)
-        formatted = org.format_context(retrievals)
 
+        # Build rich query for cross-encoder
+        rich_query = query
+        if gene_symbols:
+            rich_query += f" Patient genes: {', '.join(gene_symbols)}."
+        if tumor_type:
+            rich_query += f" Tumor type: {tumor_type}."
+
+        retrievals, kg_summary = org.format_retrievals(
+            raw_results, query=rich_query, tumor_type=tumor_type, top_k=top_k
+        )
+
+        # Return retrievals and kg_summary
         return jsonify({
             "retrievals": retrievals,
-            "formatted_context": formatted
+            "kg_summary": kg_summary
         }), 200
 
     except Exception as e:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#Neo4j Retriever 
+#Neo4j Retriever fetches rich_description from the knowledge graphs
 
 import os
 import logging
@@ -17,6 +17,7 @@ class Neo4jRetriever:
 
         self.citation_threshold = int(os.environ.get('CITATION_THRESHOLD', 3))
         self.max_cancermine_diseases = int(os.environ.get('MAX_CANCERMINE_DISEASES', 10))
+        self.max_mutations_per_gene = int(os.environ.get('MAX_MUTATIONS_PER_GENE', 10))
 
         self.base_hnc_keywords = [
             'head and neck', 'oral', 'tongue', 'larynx', 'pharynx', 'hnscc',
@@ -75,8 +76,15 @@ class Neo4jRetriever:
              collect(DISTINCT d_g.name) AS cosmic_gene_diseases,
              collect(DISTINCT d_m.name) AS cosmic_mutation_diseases,
              cm_all,
-             collect(DISTINCT m {aa_change: m.aa_change, clinvar: m.clinvar, cds_change: m.cds_change}) AS mutations
+             collect(DISTINCT m {
+                 aa_change: m.aa_change,
+                 clinvar: m.clinvar,
+                 cds_change: m.cds_change,
+                 rich_description: m.rich_description
+             }) AS mutations,
+             g.rich_description AS gene_desc
         RETURN g.symbol AS gene_symbol,
+               g.rich_description AS gene_desc,
                roles, tissues, mut_types, syndromes, mutations,
                cosmic_gene_diseases,
                cosmic_mutation_diseases,
@@ -108,46 +116,39 @@ class Neo4jRetriever:
                 cancermine_diseases = (hnc_diseases + non_hnc_diseases)[:self.max_cancermine_diseases]
                 disease_names = cosmic_diseases + [cm["name"] for cm in cancermine_diseases if cm and cm.get("name")]
 
+                # Limit mutations to max_mutations_per_gene (sorted by ClinVar pathogenicity)
+                mutations = record["mutations"]
+                # Sort mutations by ClinVar severity: Pathogenic > Likely Pathogenic > others
+                def clinvar_score(clinvar):
+                    if not clinvar:
+                        return 0
+                    c = clinvar.lower()
+                    if "pathogenic" in c and "likely" not in c:
+                        return 3
+                    elif "likely pathogenic" in c:
+                        return 2
+                    elif "risk" in c:
+                        return 1
+                    else:
+                        return 0
+                mutations_sorted = sorted(mutations, key=lambda m: clinvar_score(m.get('clinvar', '')), reverse=True)
+                mutations_limited = mutations_sorted[:self.max_mutations_per_gene]
+
                 gene_data = {
                     "symbol": record["gene_symbol"],
+                    "gene_desc": record["gene_desc"],
                     "roles": record["roles"],
                     "tissues": record["tissues"],
                     "mutation_types": record["mut_types"],
                     "syndromes": record["syndromes"],
-                    "mutations": record["mutations"],
+                    "mutations": mutations_limited,
                     "disease_names": disease_names,
                     "cosmic_diseases": cosmic_diseases,
                     "cancermine_diseases": cancermine_diseases,
                 }
                 results.append(gene_data)
 
-        all_disease_names = set()
-        for res in results:
-            all_disease_names.update(res["disease_names"])
-
-        ancestor_map = {}
-        if all_disease_names:
-            disease_list = list(all_disease_names)[:15]
-            ancestor_query = """
-            UNWIND $disease_names AS disease_name
-            OPTIONAL MATCH (h:HeNeCOnClass)
-            WHERE toLower(h.name) CONTAINS toLower(disease_name)
-               OR toLower(h.label) CONTAINS toLower(disease_name)
-            OPTIONAL MATCH path = (h)-[:SUBCLASS_OF*0..3]->(ancestor:HeNeCOnClass)
-            WITH disease_name, collect(DISTINCT ancestor.name) AS ancestors
-            RETURN disease_name, ancestors
-            """
-            with self._get_driver().session(database=self.database) as session:
-                anc_records = session.run(ancestor_query, disease_names=disease_list)
-                for rec in anc_records:
-                    ancestor_map[rec["disease_name"]] = rec["ancestors"]
-
-        for res in results:
-            disease_ancestors = {}
-            for dn in res["disease_names"]:
-                disease_ancestors[dn] = ancestor_map.get(dn, [])
-            res["disease_ancestors"] = disease_ancestors
-
+      
         return {"genes": results}
 
     def close(self):

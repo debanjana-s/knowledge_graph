@@ -1,278 +1,384 @@
 
-
 #!/usr/bin/env python3
-#Organizer: convert raw Neo4j data into evidence snippets with objective scoring.
+#Organizer: converts raw Neo4j data into evidence using cross-encoder re-ranking,
 
 import os
-import json
 import logging
+from sentence_transformers import CrossEncoder
+from ollama import Client
 
 logger = logging.getLogger(__name__)
 
-# Load treatment mapping from external JSON file
-TREATMENT_FILE = os.environ.get('TREATMENT_MAP_FILE', 'treatments.json')
+# ========== Config from environment ==========
+RERANK_TOP_K = int(os.environ.get('RERANK_TOP_K', 15))
+CROSS_ENCODER_BATCH_SIZE = int(os.environ.get('CROSS_ENCODER_BATCH_SIZE', 16))
+CROSS_ENCODER_MODEL = os.environ.get('CROSS_ENCODER_MODEL', 'cross-encoder/ms-marco-MiniLM-L-6-v2')
 
-def load_treatments():
-    try:
-        if os.path.exists(TREATMENT_FILE):
-            with open(TREATMENT_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                logger.info(f"Loaded {len(data)} treatment mappings from {TREATMENT_FILE}")
-                return data
-    except Exception as e:
-        logger.warning(f"Could not load {TREATMENT_FILE}: {e}. Using built-in fallback.")
-    return {
-        "hnscc": [
-            "Surgery (primary resection ± neck dissection)",
-            "Radiotherapy (definitive or adjuvant IMRT)",
-            "Chemotherapy (cisplatin-based, concurrent with radiation)",
-            "Targeted therapy (cetuximab for EGFR-overexpressing tumors)",
-            "Immunotherapy (pembrolizumab for recurrent/metastatic PD-L1+ disease)"
-        ],
-        "head and neck squamous cell carcinoma": [
-            "Surgery (primary resection ± neck dissection)",
-            "Radiotherapy (definitive or adjuvant IMRT)",
-            "Chemotherapy (cisplatin-based, concurrent with radiation)",
-            "Targeted therapy (cetuximab for EGFR-overexpressing tumors)",
-            "Immunotherapy (pembrolizumab for recurrent/metastatic PD-L1+ disease)"
-        ],
-        "oral squamous cell carcinoma": [
-            "Surgery (wide local excision ± neck dissection)",
-            "Radiotherapy (definitive or adjuvant)",
-            "Chemotherapy (cisplatin, 5-FU, or carboplatin)",
-            "Targeted therapy (cetuximab)",
-            "Immunotherapy (pembrolizumab/nivolumab in recurrent/metastatic)"
-        ],
-        "oral cavity squamous cell carcinoma": [
-            "Surgery (wide local excision ± neck dissection)",
-            "Radiotherapy (definitive or adjuvant)",
-            "Chemotherapy (cisplatin, 5-FU, or carboplatin)",
-            "Targeted therapy (cetuximab)",
-            "Immunotherapy (pembrolizumab/nivolumab in recurrent/metastatic)"
-        ],
-        "tongue": [
-            "Surgery (partial glossectomy ± neck dissection)",
-            "Radiotherapy (definitive or adjuvant)",
-            "Chemotherapy (cisplatin-based)",
-            "Targeted therapy (cetuximab)"
-        ],
-        "larynx": [
-            "Surgery (partial/total laryngectomy)",
-            "Radiotherapy (definitive or adjuvant)",
-            "Chemotherapy (cisplatin-based)",
-            "Targeted therapy (cetuximab)"
-        ],
-        "oropharynx": [
-            "Surgery (transoral robotic surgery)",
-            "Radiotherapy (definitive or adjuvant)",
-            "Chemotherapy (cisplatin-based)",
-            "Targeted therapy (cetuximab)"
-        ],
-        "leukoplakia": [
-            "Surgical excision (if dysplastic)",
-            "Regular surveillance",
-            "Smoking/alcohol cessation",
-            "Topical retinoids (investigational)"
-        ],
-        "erythroplakia": [
-            "Incisional biopsy and surgical excision",
-            "Regular surveillance",
-            "Smoking/alcohol cessation"
-        ]
-    }
 
-TREATMENT_MAP = load_treatments()
+_cross_encoder = None
 
-def get_treatments_for_disease(disease_name):
-    """Lookup treatments using keyword matching (case-insensitive)."""
-    if not disease_name:
-        return []
-    dn_lower = disease_name.lower()
-    for key, treatments in TREATMENT_MAP.items():
-        if key.lower() in dn_lower or dn_lower in key.lower():
-            return treatments
-    return []
-
-# ----- Scoring Functions  -----
-
-def score_cosmic_gene():
-    """COSMIC Gene Census – Tier 1 by definition."""
-    return 1.0
-
-def score_cosmic_mutation(clinvar):
-    """Score based on ClinVar pathogenicity (objective)."""
-    if not clinvar:
-        return 0.5
-    clinvar_lower = clinvar.lower()
-    if "pathogenic" in clinvar_lower and "likely" not in clinvar_lower:
-        return 1.0
-    elif "likely pathogenic" in clinvar_lower:
-        return 0.8
-    elif "risk" in clinvar_lower:
-        return 0.7
-    elif "benign" in clinvar_lower:
-        return 0.2
-    else:
-        return 0.5
-
-def score_cancermine(citations):
-    """Score CancerMine strictly based on citation count."""
-    if citations >= 100:
-        return 1.0
-    elif citations >= 50:
-        return 0.85
-    elif citations >= 20:
-        return 0.70
-    elif citations >= 10:
-        return 0.55
-    elif citations >= 3:
-        return 0.40
-    else:
-        return 0.30
-
-def score_disease_context():
-    return 0.6
+def get_cross_encoder():
+    global _cross_encoder
+    if _cross_encoder is None:
+        logger.info(f"Loading cross-encoder: {CROSS_ENCODER_MODEL}")
+        _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+        logger.info("Cross-encoder loaded.")
+    return _cross_encoder
 
 class Organizer:
-    @staticmethod
-    def format_retrievals(raw_data, top_k=10):
-        """
-        Transform raw Neo4j output into list of evidence dicts.
-        Limits mutations to top 2 per gene to balance evidence diversity.
-        """
-        retrievals = []
-        genes_data = raw_data.get("genes", [])
 
+    @staticmethod
+    def _build_item_passage(item, gene_desc):
+        """Build a text passage for a single evidence item."""
+        symbol = item["gene"]
+        target = item["target_name"]
+        item_type = item["type"]
+
+        if item_type == "gene_level":
+            role_str = ", ".join(item.get("roles", [])) if item.get("roles") else "unknown role"
+            tissue_str = ", ".join(item.get("tissues", [])) if item.get("tissues") else "various tissues"
+            mut_type_str = ", ".join(item.get("mutation_types", [])) if item.get("mutation_types") else "various mutation types"
+            syndrome_str = ", ".join(item.get("syndromes", [])) if item.get("syndromes") else "none reported"
+            passage = f"Gene {symbol}. Roles: {role_str}. Tissues: {tissue_str}. Mutation types: {mut_type_str}. Syndromes: {syndrome_str}."
+            if gene_desc:
+                passage = gene_desc + ". " + passage
+            return passage
+
+        elif item_type == "mutation":
+            aa = item.get("aa_change", "unknown")
+            clinvar = item.get("clinvar", "")
+            if clinvar:
+                return f"Gene {symbol} has mutation {aa} (ClinVar: {clinvar})."
+            else:
+                return f"Gene {symbol} has mutation {aa}."
+
+        elif item_type == "cosmic_disease":
+            disease = item["target_name"]
+            return f"Gene {symbol} is associated with {disease} (COSMIC)."
+
+        elif item_type == "cancermine":
+            disease = item["target_name"]
+            role = item.get("role", "associated")
+            citations = item.get("citations", 0)
+            return f"Gene {symbol} is reported as a {role} in {disease} ({citations} citations)."
+
+        return f"{symbol} -> {target}"
+
+    @staticmethod
+    def _flatten_items(genes_data):
+        """Flatten raw gene data into a list of evidence items with passages."""
+        items = []
         for gene in genes_data:
             symbol = gene.get("symbol", "Unknown")
+            gene_desc = gene.get("gene_desc", "")
             roles = gene.get("roles", [])
             tissues = gene.get("tissues", [])
             mut_types = gene.get("mutation_types", [])
             syndromes = gene.get("syndromes", [])
             mutations = gene.get("mutations", [])
-            disease_names = gene.get("disease_names", [])
-            disease_ancestors = gene.get("disease_ancestors", {})
             cosmic_diseases = gene.get("cosmic_diseases", [])
             cancermine_diseases = gene.get("cancermine_diseases", [])
 
-            # --- 1. Gene evidence (COSMIC) ---
-            role_str = ", ".join(roles) if roles else "unknown role"
-            tissue_str = ", ".join(tissues) if tissues else "various tissues"
-            mut_type_str = ", ".join(mut_types) if mut_types else "various mutation types"
-            syndrome_str = ", ".join(syndromes) if syndromes else "none reported"
+            # Gene-level
+            item = {
+                "gene": symbol,
+                "gene_desc": gene_desc,
+                "target_name": "gene_level",
+                "type": "gene_level",
+                "roles": roles,
+                "tissues": tissues,
+                "mutation_types": mut_types,
+                "syndromes": syndromes,
+                "score": None,
+            }
+            item["passage"] = Organizer._build_item_passage(item, gene_desc)
+            items.append(item)
 
-            content = (f"Gene {symbol} (COSMIC Cancer Gene Census): roles: {role_str}; "
-                       f"tissues: {tissue_str}; mutation types: {mut_type_str}; "
-                       f"associated syndromes: {syndrome_str}.")
-            retrievals.append({
-                "content": content,
-                "source": "COSMIC-GeneCensus",
-                "relevance_score": score_cosmic_gene(),
-                "entities": [symbol] + roles + tissues,
-                "evidence_level": "Tier 1"
-            })
+            # COSMIC diseases
+            for disease in cosmic_diseases:
+                item = {
+                    "gene": symbol,
+                    "gene_desc": gene_desc,
+                    "target_name": disease,
+                    "type": "cosmic_disease",
+                    "metadata": "COSMIC",
+                    "score": None,
+                }
+                item["passage"] = Organizer._build_item_passage(item, gene_desc)
+                items.append(item)
 
-            # --- 2. Mutations (COSMIC)  ---
-            # Sort mutations by ClinVar significance (Pathogenic > Likely Pathogenic > others)
-            mutations_sorted = sorted(
-                mutations,
-                key=lambda m: score_cosmic_mutation(m.get('clinvar', '')),
-                reverse=True
-            )
-            
-            for mut in mutations_sorted[:2]:
-                aa_change = mut.get("aa_change", "unknown")
-                clinvar = mut.get("clinvar", "")
-                cds = mut.get("cds_change", "")
-                mut_content = (f"Mutation {aa_change} in gene {symbol}: "
-                               f"CDS change: {cds}; ClinVar significance: {clinvar}.")
-                score = score_cosmic_mutation(clinvar)
-                ev_level = "Level 1" if score >= 0.9 else "Level 2" if score >= 0.7 else "Level 3"
-                retrievals.append({
-                    "content": mut_content,
-                    "source": "COSMIC-MutationCensus",
-                    "relevance_score": score,
-                    "entities": [symbol, aa_change],
-                    "evidence_level": ev_level
-                })
+            # Mutations
+            for mut in mutations:
+                item = {
+                    "gene": symbol,
+                    "gene_desc": gene_desc,
+                    "target_name": mut.get("aa_change", "unknown"),
+                    "type": "mutation",
+                    "aa_change": mut.get("aa_change", "unknown"),
+                    "clinvar": mut.get("clinvar", ""),
+                    "cds_change": mut.get("cds_change", ""),
+                    "score": None,
+                }
+                item["passage"] = Organizer._build_item_passage(item, gene_desc)
+                items.append(item)
 
-            # --- 3. COSMIC disease associations ---
-            for disease_name in cosmic_diseases:
-                ancestors = disease_ancestors.get(disease_name, [])
-                ancestor_str = " → ".join(ancestors) if ancestors else "no hierarchical context"
-                treatments = get_treatments_for_disease(disease_name)
-                treatment_str = ", ".join(treatments) if treatments else "specific treatment information not available"
-                content = (f"Disease: {disease_name}. "
-                           f"HeNeCOn hierarchical context: {ancestor_str}. "
-                           f"Associated treatments: {treatment_str}.")
-                retrievals.append({
-                    "content": content,
-                    "source": "COSMIC + HeNeCOn",
-                    "relevance_score": score_disease_context(),
-                    "entities": [disease_name] + ancestors,
-                    "evidence_level": "Clinical"
-                })
-
-            # --- 4. CancerMine disease associations ---
+            # CancerMine
             for cm in cancermine_diseases:
-                disease_name = cm["name"]
-                role = cm["role"]
-                citations = cm["citations"]
                 role_pretty = {
                     "IS_ONCOGENE_IN": "oncogene",
                     "IS_TUMOR_SUPPRESSOR_IN": "tumor suppressor",
                     "IS_DRIVER_IN": "driver"
-                }.get(role, role)
+                }.get(cm["role"], cm["role"])
+                item = {
+                    "gene": symbol,
+                    "gene_desc": gene_desc,
+                    "target_name": cm["name"],
+                    "type": "cancermine",
+                    "role": role_pretty,
+                    "citations": cm["citations"],
+                    "score": None,
+                }
+                item["passage"] = Organizer._build_item_passage(item, gene_desc)
+                items.append(item)
 
-                ancestors = disease_ancestors.get(disease_name, [])
-                ancestor_str = " → ".join(ancestors) if ancestors else "no hierarchical context"
-                treatments = get_treatments_for_disease(disease_name)
-                treatment_str = ", ".join(treatments) if treatments else "specific treatment information not available"
+        return items
 
-                content = (f"CancerMine (literature-mined): gene {symbol} is reported as a {role_pretty} in {disease_name} "
-                           f"({citations} supporting publications). "
-                           f"HeNeCOn hierarchical context: {ancestor_str}. "
-                           f"Associated treatments: {treatment_str}.")
+    @staticmethod
+    def _clean_item(item):
+        """Return a clean version of an item (remove bulky fields)."""
+        cleaned = {
+            "gene": item.get("gene"),
+            "target_name": item.get("target_name"),
+            "type": item.get("type"),
+            "score": item.get("score"),
+        }
+        if "citations" in item:
+            cleaned["citations"] = item["citations"]
+        if "role" in item:
+            cleaned["role"] = item["role"]
+        if "clinvar" in item:
+            cleaned["clinvar"] = item["clinvar"]
+        if "aa_change" in item:
+            cleaned["aa_change"] = item["aa_change"]
+        return cleaned
 
-                score = score_cancermine(citations)
-
-                if score >= 0.85:
-                    ev_level = "Level 1"
-                elif score >= 0.70:
-                    ev_level = "Level 2"
-                elif score >= 0.55:
-                    ev_level = "Level 3"
-                else:
-                    ev_level = "Level 4"
-
-                retrievals.append({
-                    "content": content,
-                    "source": "CancerMine",
-                    "relevance_score": round(score, 3),
-                    "entities": [symbol, disease_name],
-                    "evidence_level": ev_level,
-                    "citations": citations
+    @staticmethod
+    def _aggregate_items(items):
+        """
+        Aggregate items by (gene, target_name).
+        For each group, collect roles/citations and COSMIC flags.
+        Returns a list of dicts with keys: gene, disease, roles (list of {role, citations}), cosmic (bool).
+        """
+        groups = {}
+        for item in items:
+            # Skip gene-level and mutation items for aggregation
+            if item["type"] in ["gene_level", "mutation"]:
+                continue
+            key = (item["gene"], item["target_name"])
+            if key not in groups:
+                groups[key] = {
+                    "gene": item["gene"],
+                    "disease": item["target_name"],
+                    "roles": [],
+                    "cosmic": False
+                }
+            if item["type"] == "cancermine":
+                groups[key]["roles"].append({
+                    "role": item.get("role", "associated"),
+                    "citations": item.get("citations", 0)
                 })
+            elif item["type"] == "cosmic_disease":
+                groups[key]["cosmic"] = True
 
-        # Deduplicate by content (keep highest score)
-        seen = {}
-        for r in retrievals:
-            key = r["content"]
-            if key not in seen or r["relevance_score"] > seen[key]["relevance_score"]:
-                seen[key] = r
+        # Convert to list and sort by gene, then disease
+        aggregated = list(groups.values())
+        aggregated.sort(key=lambda x: (x["gene"], x["disease"]))
+        return aggregated
 
-        # Sort by relevance score descending and return top_k
-        sorted_items = sorted(seen.values(), key=lambda x: x["relevance_score"], reverse=True)
-        return sorted_items[:top_k]
+    @staticmethod
+    def _build_aggregated_text(aggregated, genes_data, tumor_type):
+        """Build a text block from aggregated evidence for LLM prompt."""
+        lines = []
+        for group in aggregated:
+            gene = group["gene"]
+            disease = group["disease"]
+            roles = group["roles"]
+            cosmic = group["cosmic"]
+
+            # Get gene roles from raw data
+            gene_data = next((g for g in genes_data if g["symbol"] == gene), {})
+            gene_role_str = ", ".join(gene_data.get("roles", [])) if gene_data.get("roles") else "unknown role"
+
+            role_strs = []
+            for r in roles:
+                role_strs.append(f"{r['role']} ({r['citations']} citations)")
+            if cosmic:
+                role_strs.append("COSMIC association")
+
+            if role_strs:
+                line = f"Gene {gene} ({gene_role_str}) associated with {disease} as {', '.join(role_strs)}"
+            else:
+                line = f"Gene {gene} ({gene_role_str}) associated with {disease}"
+            lines.append(line)
+
+        # Add tumor type context
+        context = f"Patient has tumor type: {tumor_type if tumor_type else 'not specified'}.\n"
+        return context + "\n".join(lines)
+
+    @staticmethod
+    def _generate_llm_summary(aggregated_text, tumor_type, query):
+        """Call Ollama to generate a clinical summary from aggregated evidence."""
+        # Read LLM settings at runtime (after .env is loaded)
+        enable_llm = os.environ.get('ENABLE_LLM_SUMMARY', 'false').lower() == 'true'
+        if not enable_llm:
+            logger.info("LLM summary disabled (ENABLE_LLM_SUMMARY=false)")
+            return None
+
+        host = os.environ.get('OLLAMA_HOST', 'http://10.5.30.32:11434')
+        model = os.environ.get('OLLAMA_MODEL', 'gemma4:12b')
+        timeout = int(os.environ.get('OLLAMA_TIMEOUT', 30))
+
+        logger.info(f"Attempting LLM summary with host={host}, model={model}")
+
+        prompt = f"""You are a clinical oncologist. Based on the following aggregated evidence for a patient with {tumor_type if tumor_type else 'head and neck cancer'}, summarise the key molecular findings in 2–3 sentences that are clinically relevant. Do not add new facts; only synthesise what is given.
+
+Evidence:
+{aggregated_text}
+
+Summary:"""
+
+        try:
+            client = Client(host=host, timeout=timeout)
+            response = client.chat(
+                model=model,
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'temperature': 0.3, 'max_tokens': 150}
+            )
+            if response and response.message and response.message.content:
+                return response.message.content.strip()
+            else:
+                logger.warning("LLM response had no content.")
+                return None
+        except Exception as e:
+            logger.error(f"Ollama LLM call failed: {e}")
+            return None
+
+    @staticmethod
+    def _build_template_summary(aggregated, genes_data):
+        """Fallback: template-based summary from aggregated data."""
+        if not aggregated:
+            return "_No relevant medical evidence retrieved._"
+
+        sentences = []
+        for group in aggregated:
+            gene = group["gene"]
+            disease = group["disease"]
+            roles = group["roles"]
+            cosmic = group["cosmic"]
+
+            gene_data = next((g for g in genes_data if g["symbol"] == gene), {})
+            gene_role_str = ", ".join(gene_data.get("roles", [])) if gene_data.get("roles") else "unknown role"
+
+            role_strs = []
+            for r in roles:
+                role_strs.append(f"{r['role']} ({r['citations']} citations)")
+            if cosmic:
+                role_strs.append("COSMIC")
+
+            if role_strs:
+                sentences.append(f"Gene {gene} ({gene_role_str}) associated with {disease} as {', '.join(role_strs)}")
+            else:
+                sentences.append(f"Gene {gene} ({gene_role_str}) associated with {disease}")
+
+        return "The following evidence supports the prediction: " + ". ".join(sentences) + "."
+
+    @staticmethod
+    def format_retrievals(raw_data, query, tumor_type=None, top_k=None):
+        """
+        Transform raw Neo4j output into re-ranked, aggregated evidence.
+        Returns: (retrievals, kg_summary)
+        """
+        genes_data = raw_data.get("genes", [])
+        if not genes_data:
+            return [], "_No relevant medical evidence retrieved."
+
+        # Flatten into evidence items
+        items = Organizer._flatten_items(genes_data)
+        if not items:
+            return [], "_No relevant medical evidence retrieved."
+
+        # Re-rank with cross-encoder
+        cross_encoder = get_cross_encoder()
+        query_pairs = [(query, item["passage"]) for item in items]
+
+        scores = []
+        for i in range(0, len(query_pairs), CROSS_ENCODER_BATCH_SIZE):
+            batch = query_pairs[i:i + CROSS_ENCODER_BATCH_SIZE]
+            batch_scores = cross_encoder.predict(batch, convert_to_tensor=False)
+            if isinstance(batch_scores, (int, float)):
+                batch_scores = [batch_scores]
+            scores.extend(batch_scores)
+
+        for idx, item in enumerate(items):
+            item["score"] = float(scores[idx])
+
+        sorted_items = sorted(items, key=lambda x: x["score"], reverse=True)
+
+        # Candidate pool size
+        candidate_limit = RERANK_TOP_K
+        candidate_items = sorted_items[:candidate_limit]
+
+        # Output limit from request (top_k)
+        if top_k is not None and top_k > 0:
+            output_limit = min(top_k, len(candidate_items))
+        else:
+            output_limit = candidate_limit
+
+        # Take top items for retrieval list
+        top_items = candidate_items[:output_limit]
+
+        # Clean retrieval items
+        cleaned_retrievals = []
+        for item in top_items:
+            cleaned = Organizer._clean_item(item)
+            cleaned_retrievals.append(cleaned)
+
+        # Remove duplicates
+        seen = set()
+        unique_retrievals = []
+        for item in cleaned_retrievals:
+            key = (item.get("gene"), item.get("target_name"), item.get("type"))
+            if key not in seen:
+                seen.add(key)
+                unique_retrievals.append(item)
+
+        unique_retrievals = sorted(unique_retrievals, key=lambda x: x.get("score", -float('inf')), reverse=True)
+
+        # ---------- Aggregation ----------
+        aggregated = Organizer._aggregate_items(candidate_items)
+
+        # Build aggregated text for LLM prompt
+        aggregated_text = Organizer._build_aggregated_text(aggregated, genes_data, tumor_type)
+
+        # Generate summary
+        llm_summary = Organizer._generate_llm_summary(aggregated_text, tumor_type, query)
+        if llm_summary:
+            kg_summary = llm_summary
+            logger.info("LLM summary generated successfully.")
+        else:
+            logger.info("LLM summary returned None, falling back to template.")
+            kg_summary = Organizer._build_template_summary(aggregated, genes_data)
+
+        return unique_retrievals, kg_summary
 
     @staticmethod
     def format_context(retrievals):
-        """Build the bulleted context string for the orchestrator."""
+        """Legacy: kept for compatibility."""
         if not retrievals:
             return "_No relevant medical evidence retrieved._"
         lines = []
         for i, r in enumerate(retrievals, 1):
-            ev = f" [evidence {r['evidence_level']}]" if r.get("evidence_level") else ""
-            score_str = f"{r.get('relevance_score', 0):.3f}"
-            lines.append(f"{i}. ({r['source']}{ev}, relevance {score_str}) {r['content']}")
+            score_str = f"{r.get('score', 0):.3f}" if r.get('score') is not None else ""
+            source = r.get('source', r.get('type', 'unknown'))
+            lines.append(f"{i}. ({source}, relevance {score_str}) {r.get('target_name', '')}")
         return "\n".join(lines)

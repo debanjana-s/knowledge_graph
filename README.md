@@ -1,28 +1,37 @@
 # GraphRAG for Oral Cancer Knowledge Graph
 
-A Neo4j‑based GraphRAG system for oral cancer clinical decision support. It acts as the evidence engine for the orchestrator, providing structured, citation‑backed facts when the medical LLM's confidence is low.
+A Neo4j-based Graph Retrieval-Augmented Generation service for oral cancer clinical decision support.
 
-It bridges the gap between the orchestrator's low‑confidence state and the Knowledge Graph by:
+It retrieves structured biomedical evidence from a Neo4j knowledge graph, re-ranks it using a cross-encoder, and returns concise, citation-backed evidences. It is designed to serve as the retrieval engine for the orchestrator, providing additional knowledge whenever the medical LLM's confidence is low.
 
-Retrieving structured evidence from Neo4j – gene roles, tissues, mutation types, syndromes, ClinVar‑annotated mutations, disease associations (from COSMIC), and literature‑mined gene‑cancer roles with citation counts (from CancerMine).
+---
 
-Scoring evidence objectively using COSMIC Tiers, ClinVar classifications, and CancerMine citation counts.
+## Features
 
-Formatting the evidence into a bulleted, numbered context string that the orchestrator can directly paste into the augmented prompt.
+* Retrieve structured biomedical evidence from a Neo4j knowledge graph
+* Query multiple evidence sources simultaneously:
 
-This builds a knowledge graph that integrates COSMIC Gene Census, COSMIC Mutation Census, CancerMine , and HeNeCOn (Head and Neck Cancer Ontology). It exposes a simple REST API that the orchestrator calls when confidence is low, returning evidence snippets with relevance scores and a formatted context string ready for LLM ingestion.
+  * COSMIC Gene Census
+  * COSMIC Mutation Census
+  * CancerMine
+  * HeNeCOn ontology
+* Re-rank retrieved evidence using the MS MARCO MiniLM Cross Encoder
+* Aggregate redundant evidence into concise gene–disease summaries
+* REST API for seamless integration with external orchestration systems
+* Returns both ranked evidence and an LLM-ready context paragraph
 
+---
 
 ## Repository Structure
 
-```
+```text
 graphrag/
-├── app.py                     # Flask API
-├── neo4j_retriever.py         # Cypher queries
-├── organizer.py               # Evidence formatting + scoring
-├── requirements.txt           # Dependencies
-├── .env.example               # Environment template
-└── orchestrator_adapter.py    # HTTP client for orchestrator integration
+├── app.py                     # Flask REST API
+├── neo4j_retriever.py         # Cypher retrieval layer
+├── organizer.py               # Re-ranking & aggregation
+├── orchestrator_adapter.py    # Client used by the orchestrator
+├── requirements.txt
+└── .env.example
 
 knowledge_graph/
 ├── import_cancermine.py
@@ -31,91 +40,208 @@ knowledge_graph/
 └── import_mutation_census.py
 ```
 
+---
+
+
 ## Prerequisites
 
-| Requirement | Details |
-|-------------|---------|
-| Neo4j | Running with the database populated. |
-| Dependencies | See `requirements.txt`. |
+| Requirement  | Version                         |
+| ------------ | ------------------------------- |
+| Python       | 3.9+                            |
+| Neo4j        | Running with populated database |
+| Dependencies | `requirements.txt`              |
 
-## Setup
+The Neo4j database should already contain data imported from:
 
-### 1. Clone & Install
+* COSMIC Gene Census
+* COSMIC Mutation Census
+* CancerMine
+* HeNeCOn
+
+---
+
+## Installation
+
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/debanjana-s/knowledge_graph.git
 cd graphrag
+```
+
+### 2. Install Dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment
+### 3. Configure Environment
+
+Copy the example configuration.
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+---
 
-```env
-NEO4J_URI=neo4j://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=your_password
-NEO4J_DATABASE=cosmicmutationhenecon
-GRAPH_RAG_PORT=5000
-
-```
-
-### 3. Run the Service
+## Running the Service
 
 ```bash
 python app.py
 ```
 
-Service available at: `http://127.0.0.1:5000`
+The API will be available at
 
-## API Endpoints
-
-### GET /health
-
-Check service and Neo4j connectivity.
-
-**Response:**
-
-```json
-{"status": "ready", "neo4j": "connected"}
+```
+http://127.0.0.1:5000
 ```
 
-### POST /retrieve
+---
 
-Retrieve evidence for a set of genes.
+## API
 
-**Request:**
+### Health Check
+
+#### GET `/health`
+
+Checks service readiness and Neo4j connectivity.
+
+#### Response
+
+```json
+{
+  "status": "ready",
+  "neo4j": "connected"
+}
+```
+
+---
+
+### Retrieve Evidence
+
+#### POST `/retrieve`
+
+Retrieves and re-ranks evidence for the supplied patient context.
+
+#### Request
 
 ```json
 {
   "patient_context": {
-    "genes": [{"symbol": "TP53"}],
+    "genes": [
+      {"symbol": "TP53"},
+      {"symbol": "EGFR"}
+    ],
     "tumor_type": "HNSCC"
   },
+  "query": "Explain why this patient is predicted to have oral cancer.",
   "top_k": 5
 }
 ```
 
-## Evidence Scoring
+#### Parameters
 
-| Evidence Type | Score | Basis |
-|---------------|-------|-------|
-| COSMIC Gene Census | 1.0 | Expert-curated Tier 1 |
-| COSMIC Mutation (Pathogenic) | 1.0 | ClinVar classification |
-| COSMIC Mutation (Likely Pathogenic) | 0.8 | ClinVar classification |
-| CancerMine (≥100 citations) | 1.0 | Literature support |
-| CancerMine (≥50 citations) | 0.85 | Literature support |
-| CancerMine (≥20 citations) | 0.70 | Literature support |
+| Field                      | Description                        |
+| -------------------------- | ---------------------------------- |
+| patient_context.genes      | List of gene symbols               |
+| patient_context.tumor_type | Primary tumour site                |
+| query                      | Question from the orchestrator     |
+| top_k                      | Number of evidence items to return |
 
-## Data Sources
+#### Response
 
-| Source | Data |
-|--------|------|
-| COSMIC | Gene Census (roles, tissues, mutation types) & Mutation Census (ClinVar) |
-| CancerMine | Literature-mined gene-disease roles with citation counts |
-| HeNeCOn | Head and Neck Cancer Ontology (staging, pathology, treatments) |
+```json
+{
+  "retrievals": [
+    {
+      "gene": "TP53",
+      "target_name": "head and neck squamous cell carcinoma",
+      "type": "cancermine",
+      "score": 1.88,
+      "citations": 54,
+      "role": "tumor suppressor"
+    }
+  ],
+  "kg_summary": "The following evidence supports..."
+}
+```
+
+---
+
+## Retrieval Pipeline
+
+### 1. Neo4j Retrieval
+
+The retriever gathers all available evidence for the supplied genes.
+
+Retrieved information includes:
+
+* Gene roles
+* Associated tissues
+* Mutation types
+* Syndromes
+* COSMIC disease associations
+* CancerMine gene–disease relationships
+* ClinVar mutation annotations
+
+CancerMine associations are prioritised by:
+
+1. Head and Neck Cancer entries
+2. Citation count
+3. Remaining diseases
+
+---
+
+### 2. Query Enrichment
+
+Before re-ranking, the original query is expanded with patient-specific context.
+
+---
+
+### 3. Cross-Encoder Re-ranking
+
+Each retrieved evidence item is converted into a natural language passage.
+
+
+All passages are scored using
+
+```
+cross-encoder/ms-marco-MiniLM-L-6-v2
+```
+
+against the enriched query.
+
+---
+
+### 4. Evidence Aggregation
+
+The highest-ranked evidence is grouped by
+
+```
+(Gene, Disease)
+```
+
+Multiple roles and citation counts are merged into a single concise statement to reduce redundancy while preserving supporting evidence.
+
+---
+
+## Knowledge Graph Sources
+
+| Source                 | Data                                           | Relationships                                            |
+| ---------------------- | ---------------------------------------------- | -------------------------------------------------------- |
+| COSMIC Gene Census     | Gene roles, tissues, mutation types, syndromes | HAS_ROLE, HAS_TISSUE, HAS_MUTATION_TYPE, ASSOCIATED_WITH |
+| COSMIC Mutation Census | Mutations, ClinVar significance, diseases      | HAS_MUTATION, ASSOCIATED_WITH                            |
+| CancerMine             | Gene–disease roles with citation counts        | IS_ONCOGENE_IN, IS_DRIVER_IN, IS_TUMOR_SUPPRESSOR_IN     |
+| HeNeCOn                | Oral cancer ontology                           | SUBCLASS_OF                                              |
+
+---
+
+
+## Output
+
+
+* retrievals – ranked individual evidence items
+* kg_summary – aggregated evidence formatted as a compact paragraph ready for LLM ingestion
+
+The GraphRAG service is intended to operate as the evidence retrieval component of a larger multi-agent medical reasoning pipeline, supplying structured, citation-backed knowledge whenever additional clinical evidence is required.
